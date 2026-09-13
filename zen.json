@@ -1,0 +1,9 @@
+{
+  "name": "compression",
+  "version": "1.0.0",
+  "author": "Jishith-dev",
+  "repo": "https://github.com/Jishith-dev/compression",
+  "description": "A simple ZEN library for GZIP compression and decompression, plus ZIP archive creation and extraction.",
+  "bin": "lib.zen",
+  "dependencies": {}
+}

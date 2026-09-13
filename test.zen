@@ -1,0 +1,21 @@
+import (Compression) from "lib.zen"
+
+Compression c
+
+screen("=== Compression v1 ===")
+
+fs.writeFile("hello.txt", "Hello from Zen!")
+fs.writeFile("data.txt", "Zen compression library")
+
+screen("--- gzip ---")
+screen(c.gzip("hello.txt", "hello.gz"))
+screen(c.gunzip("hello.gz", "hello_restored.txt"))
+
+screen("--- zip ---")
+List<string> files = ["hello.txt", "data.txt"]
+screen(c.zip(files, "archive.zip"))
+
+screen("--- unzip ---")
+screen(c.unzip("archive.zip", "out"))
+
+screen("=== Tests completed ===")
