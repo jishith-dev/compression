@@ -2,20 +2,88 @@ import (Compression) from "lib.zen"
 
 Compression c
 
-screen("=== Compression v1 ===")
+string url = "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt"
 
-fs.writeFile("hello.txt", "Hello from Zen!")
-fs.writeFile("data.txt", "Zen compression library")
+screen("Downloading test data...")
 
-screen("--- gzip ---")
-screen(c.gzip("hello.txt", "hello.gz"))
-screen(c.gunzip("hello.gz", "hello_restored.txt"))
+string data = http.get(url)
 
-screen("--- zip ---")
-List<string> files = ["hello.txt", "data.txt"]
-screen(c.zip(files, "archive.zip"))
+if (http.lastStatus() != 200) {
+    screen("Download failed: HTTP " + http.lastStatus())
+    os.exit(1)
+}
 
-screen("--- unzip ---")
-screen(c.unzip("archive.zip", "out"))
+screen("Downloaded: " + length(data) + " bytes")
 
-screen("=== Tests completed ===")
+fs.writeFile("test_input.txt", data)
+
+List<byte> bytes = stringToBytes(data)
+
+screen("CRC32: " + c.crc32(bytes))
+screen("Adler32: " + c.adler32(bytes))
+
+List<byte> gzipData = c.gzipBytes(bytes, 6)
+List<byte> gzipOutput = []
+
+c.gunzipBytes(gzipData, gzipOutput)
+
+screen("GZIP: " + length(gzipData) + " bytes")
+screen("GZIP round trip: " + (bytesToString(gzipOutput) == data))
+
+List<byte> zlibData = c.zlibBytes(bytes, 6)
+List<byte> zlibOutput = []
+
+c.unzlibBytes(zlibData, zlibOutput)
+
+screen("Zlib: " + length(zlibData) + " bytes")
+screen("Zlib round trip: " + (bytesToString(zlibOutput) == data))
+
+List<byte> deflateData = c.deflateBytes(bytes, 6)
+List<byte> deflateOutput = []
+
+c.inflateBytes(deflateData, deflateOutput)
+
+screen("Deflate: " + length(deflateData) + " bytes")
+screen("Deflate round trip: " + (bytesToString(deflateOutput) == data))
+
+c.gzip("test_input.txt", "test_input.gz", 6)
+c.gunzip("test_input.gz", "test_gzip_output.txt")
+
+string gzipOutputFile = fs.readFile("test_gzip_output.txt")
+
+screen("GZIP file: " + (gzipOutputFile == data))
+
+List<string> files = [
+    "test_input.txt"
+]
+
+c.zip(files, "test.zip", 6)
+c.unzip("test.zip", "test_unzip")
+
+string zipOutput = fs.readFile("test_unzip/test_input.txt")
+
+screen("ZIP: " + (zipOutput == data))
+
+List<string> names = [
+    "words.txt"
+]
+
+c.zipAs(files, names, "test_named.zip", 6)
+c.unzip("test_named.zip", "test_named_unzip")
+
+string namedOutput = fs.readFile("test_named_unzip/words.txt")
+
+screen("ZIP custom name: " + (namedOutput == data))
+
+screen("Done")
+
+/*
+Test with system commands:
+
+ls -lh test_input.txt test_input.gz test.zip test_named.zip
+head test_input.txt
+gzip -dc test_input.gz > out.txt && cmp test_input.txt out.txt && echo "GZIP: OK"
+unzip -t test.zip
+unzip -l test_named.zip
+
+*/

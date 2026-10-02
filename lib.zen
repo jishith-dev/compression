@@ -1,36 +1,74 @@
+/*
+    lib.zen - DEFLATE / gzip / zlib / ZIP for Zen
+
+    Public API
+      Files:     gzip, gunzip, zip, zipAs, unzip
+      Bytes:     gzipBytes, gunzipBytes, zlibBytes, unzlibBytes, deflateBytes, inflateBytes
+      Checksums: crc32, adler32
+
+    Levels:  0 = store, 1 = fastest ... 9 = best (default 6)
+    Errors:  failures print "compression: ..." with screen() and return false.
+    Limits:  ZIP64 is not supported (no entry or archive over 4 GB, max 65535 entries).
+*/
+
 struct Compression {
 
-    /* ---------------- Public API ---------------- */
+    /* ================= Public API: files ================= */
 
     gzip(string source, string destination, int level = 6) bool {
         List<byte> input = fs.readFileBytes(source)
-        List<byte> output = this.gzipCompress(input, level)
+        List<byte> output = this.gzipBytes(input, level)
         fs.writeFileBytes(destination, output)
         return true
     }
 
     gunzip(string source, string destination) bool {
         List<byte> input = fs.readFileBytes(source)
-        List<byte> output = this.gzipDecompress(input)
+        List<byte> output = []
+        if (!this.gunzipBytes(input, output)) {
+            return false
+        }
         fs.writeFileBytes(destination, output)
         return true
     }
 
     zip(List<string> sources, string destination, int level = 6) bool {
-        List<byte> result = this.zipFiles(sources, level)
-        fs.writeFileBytes(destination, result)
+        return this.zipAs(sources, sources, destination, level)
+    }
+
+    zipAs(List<string> sources, List<string> names, string destination, int level = 6) bool {
+        if (sources.length != names.length) {
+            screen("compression: sources and names must have the same length")
+            return false
+        }
+        List<byte> archive = []
+        if (!this.buildZip(sources, names, level, archive)) {
+            return false
+        }
+        fs.writeFileBytes(destination, archive)
         return true
     }
 
     unzip(string source, string destination) bool {
-        fs.makeDir(destination)
         List<byte> data = fs.readFileBytes(source)
-        return this.unzipFile(data, destination)
+        return this.unzipBytes(data, destination)
     }
 
-    /* ---------------- GZIP ---------------- */
+    /* ================= Public API: bytes ================= */
 
-    gzipCompress(List<byte> data, int level) List<byte> {
+    deflateBytes(List<byte> data, int level) List<byte> {
+        List<byte> result = []
+        this.deflateInto(data, this.clampLevel(level), result)
+        return result
+    }
+
+    inflateBytes(List<byte> data, List<byte> output) bool {
+        int endPos = this.inflateRange(data, 0, data.length, output, this.maxOutput())
+        return endPos >= 0
+    }
+
+    gzipBytes(List<byte> data, int level) List<byte> {
+        int lvl = this.clampLevel(level)
         List<byte> result = []
 
         result.push(31B)
@@ -41,113 +79,289 @@ struct Compression {
         result.push(0B)
         result.push(0B)
         result.push(0B)
-        result.push(0B)
-        result.push(3B)
 
-        List<byte> deflateData = []
-
-        if (level > 0) {
-            deflateData = this.deflateCompress(data)
+        if (lvl == 9) {
+            result.push(2B)
+        } else if (lvl == 1) {
+            result.push(4B)
         } else {
-            deflateData = this.deflateStore(data)
+            result.push(0B)
         }
 
-        int i = 0
-        while (i < deflateData.length) {
-            result.push(deflateData[i])
-            i = i + 1
-        }
+        result.push(255B)
 
-        long crc = this.crc32(data)
-        this.pushU32(result, crc)
+        this.deflateInto(data, lvl, result)
+        this.pushU32L(result, this.crc32(data))
         this.pushU32(result, data.length)
-
         return result
     }
 
-    gzipDecompress(List<byte> data) List<byte> {
-        List<byte> empty = []
+    gunzipBytes(List<byte> data, List<byte> output) bool {
+        int n = data.length
+        int pos = 0
+        bool more = true
 
-        if (data.length < 18) {
-            screen("Invalid GZIP data")
-            return empty
+        while (more) {
+            if (pos + 18 > n || data[pos] != 31B || data[pos + 1] != 139B) {
+                screen("compression: invalid gzip header")
+                return false
+            }
+            if (data[pos + 2] != 8B) {
+                screen("compression: unsupported gzip compression method")
+                return false
+            }
+
+            int flags = (Int(data[pos + 3]) & 255)
+            pos = pos + 10
+
+            if ((flags & 4) != 0) {
+                if (pos + 2 > n) {
+                    screen("compression: truncated gzip header")
+                    return false
+                }
+                pos = pos + 2 + this.readU16(data, pos)
+            }
+            if ((flags & 8) != 0) {
+                pos = this.skipZeroTerminated(data, pos)
+                if (pos < 0) {
+                    screen("compression: truncated gzip header")
+                    return false
+                }
+            }
+            if ((flags & 16) != 0) {
+                pos = this.skipZeroTerminated(data, pos)
+                if (pos < 0) {
+                    screen("compression: truncated gzip header")
+                    return false
+                }
+            }
+            if ((flags & 2) != 0) {
+                pos = pos + 2
+            }
+            if (pos + 8 > n) {
+                screen("compression: truncated gzip data")
+                return false
+            }
+
+            int memberStart = output.length
+            int endPos = this.inflateRange(data, pos, n, output, this.maxOutput())
+            if (endPos < 0) {
+                return false
+            }
+            if (endPos + 8 > n) {
+                screen("compression: truncated gzip trailer")
+                return false
+            }
+
+            long expectedCrc = this.readU32(data, endPos)
+            long expectedSize = this.readU32(data, endPos + 4)
+            long produced = Long(output.length - memberStart)
+
+            if (this.crc32Range(output, memberStart, output.length) != expectedCrc) {
+                screen("compression: gzip checksum mismatch (corrupt data)")
+                return false
+            }
+            if ((produced & 4294967295L) != expectedSize) {
+                screen("compression: gzip size mismatch (corrupt data)")
+                return false
+            }
+
+            pos = endPos + 8
+            more = false
+            if (pos + 18 <= n && data[pos] == 31B && data[pos + 1] == 139B) {
+                more = true
+            }
         }
 
-        if (data[0] != 31B || data[1] != 139B || data[2] != 8B) {
-            screen("Invalid GZIP header")
-            return empty
-        }
-
-        return this.deflateDecompress(data, 10)
+        return true
     }
 
-    /* ---------------- ZIP (multi-file) ---------------- */
-
-    zipFiles(List<string> sources, int level) List<byte> {
+    zlibBytes(List<byte> data, int level) List<byte> {
+        int lvl = this.clampLevel(level)
         List<byte> result = []
 
-        List<int> localOffsets = []
+        result.push(120B)
+        if (lvl <= 1) {
+            result.push(1B)
+        } else if (lvl <= 5) {
+            result.push(94B)
+        } else if (lvl == 6) {
+            result.push(156B)
+        } else {
+            result.push(218B)
+        }
+
+        this.deflateInto(data, lvl, result)
+
+        long adler = this.adler32Range(data, 0, data.length)
+        this.pushU32BE(result, adler)
+        return result
+    }
+
+    unzlibBytes(List<byte> data, List<byte> output) bool {
+        int n = data.length
+        if (n < 6) {
+            screen("compression: zlib data too short")
+            return false
+        }
+
+        int cmf = (Int(data[0]) & 255)
+        int flg = (Int(data[1]) & 255)
+
+        if ((cmf & 15) != 8 || ((cmf * 256 + flg) % 31) != 0) {
+            screen("compression: invalid zlib header")
+            return false
+        }
+        if ((flg & 32) != 0) {
+            screen("compression: zlib preset dictionaries are not supported")
+            return false
+        }
+
+        int start = output.length
+        int endPos = this.inflateRange(data, 2, n, output, this.maxOutput())
+        if (endPos < 0) {
+            return false
+        }
+        if (endPos + 4 > n) {
+            screen("compression: truncated zlib trailer")
+            return false
+        }
+
+        long expected = this.readU32BE(data, endPos)
+        if (this.adler32Range(output, start, output.length) != expected) {
+            screen("compression: zlib checksum mismatch (corrupt data)")
+            return false
+        }
+        return true
+    }
+
+    /* ================= Checksums ================= */
+
+    crc32(List<byte> data) long {
+        return this.crc32Range(data, 0, data.length)
+    }
+
+    private crc32Range(List<byte> data, int start, int end) long {
+        List<long> table = this.crcTable()
+        long crc = 4294967295L
+        int i = start
+
+        while (i < end) {
+            int idx = Int((crc ^ Long((Int(data[i]) & 255))) & 255L)
+            crc = table[idx] ^ (crc >> 8L)
+            i = i + 1
+        }
+
+        return crc ^ 4294967295L
+    }
+
+    adler32(List<byte> data) long {
+        return this.adler32Range(data, 0, data.length)
+    }
+
+    private adler32Range(List<byte> data, int start, int end) long {
+        long a = 1L
+        long b = 0L
+        int i = start
+
+        while (i < end) {
+            a = (a + Long((Int(data[i]) & 255))) % 65521L
+            b = (b + a) % 65521L
+            i = i + 1
+        }
+
+        return b * 65536L + a
+    }
+
+    private crcTable() List<long> {
+        List<long> table = []
+        int n = 0
+
+        while (n < 256) {
+            long c = Long(n)
+            int k = 0
+            while (k < 8) {
+                if ((c & 1L) != 0L) {
+                    c = 3988292384L ^ (c >> 1L)
+                } else {
+                    c = c >> 1L
+                }
+                k = k + 1
+            }
+            table.push(c)
+            n = n + 1
+        }
+
+        return table
+    }
+
+    /* ================= ZIP: create ================= */
+
+    private buildZip(List<string> sources, List<string> names, int level, List<byte> result) bool {
+        int lvl = this.clampLevel(level)
+        int n = sources.length
+
+        if (n > 65535) {
+            screen("compression: too many files for a ZIP archive (max 65535)")
+            return false
+        }
+
+        List<string> entryNames = []
+        List<int> offsets = []
+        List<int> methods = []
         List<long> crcs = []
         List<int> compSizes = []
-        List<int> uncompSizes = []
-        List<int> methods = []
+        List<int> rawSizes = []
 
-        int n = sources.length
         int idx = 0
-
         while (idx < n) {
-            string name = sources[idx]
-            List<byte> data = fs.readFileBytes(name)
+            string entry = this.entryName(names[idx])
+            int nameLen = length(entry)
+
+            if (nameLen == 0 || nameLen > 65535 || !this.isSafeName(entry)) {
+                screen("compression: invalid entry name for " + sources[idx] + " (use zipAs to set a name)")
+                return false
+            }
+
+            List<byte> data = fs.readFileBytes(sources[idx])
+            if (data.length > 2000000000 || result.length > 2000000000) {
+                screen("compression: archive too large (ZIP64 is not supported)")
+                return false
+            }
 
             long crc = this.crc32(data)
-            int uncompSize = data.length
-
             List<byte> payload = data
             int method = 0
 
-            if (level > 0) {
-                List<byte> compressed = this.deflateCompress(data)
-                if (compressed.length < data.length) {
-                    payload = compressed
+            if (lvl > 0 && data.length > 0) {
+                List<byte> packed = []
+                this.deflateInto(data, lvl, packed)
+                if (packed.length < data.length) {
+                    payload = packed
                     method = 8
                 }
             }
 
-            int compSize = payload.length
-            int nameLength = length(name)
-            int localOffset = result.length
-
-            localOffsets.push(localOffset)
-            crcs.push(crc)
-            compSizes.push(compSize)
-            uncompSizes.push(uncompSize)
+            entryNames.push(entry)
+            offsets.push(result.length)
             methods.push(method)
+            crcs.push(crc)
+            compSizes.push(payload.length)
+            rawSizes.push(data.length)
 
             this.pushU32(result, 67324752)
             this.pushU16(result, 20)
-            this.pushU16(result, 0)
+            this.pushU16(result, 2048)
             this.pushU16(result, method)
             this.pushU16(result, 0)
+            this.pushU16(result, 33)
+            this.pushU32L(result, crc)
+            this.pushU32(result, payload.length)
+            this.pushU32(result, data.length)
+            this.pushU16(result, nameLen)
             this.pushU16(result, 0)
-
-            this.pushU32(result, crc)
-            this.pushU32(result, compSize)
-            this.pushU32(result, uncompSize)
-
-            this.pushU16(result, nameLength)
-            this.pushU16(result, 0)
-
-            int c = 0
-            while (c < nameLength) {
-                result.push(Byte(toInt(name[c])))
-                c = c + 1
-            }
-
-            int p = 0
-            while (p < payload.length) {
-                result.push(payload[p])
-                p = p + 1
-            }
+            this.appendName(result, entry)
+            this.appendRange(result, payload, 0, payload.length)
 
             idx = idx + 1
         }
@@ -156,35 +370,26 @@ struct Compression {
         idx = 0
 
         while (idx < n) {
-            string name = sources[idx]
-            int nameLength = length(name)
+            string entry = entryNames[idx]
 
             this.pushU32(result, 33639248)
             this.pushU16(result, 20)
             this.pushU16(result, 20)
-            this.pushU16(result, 0)
+            this.pushU16(result, 2048)
             this.pushU16(result, methods[idx])
             this.pushU16(result, 0)
-            this.pushU16(result, 0)
-
-            this.pushU32(result, crcs[idx])
+            this.pushU16(result, 33)
+            this.pushU32L(result, crcs[idx])
             this.pushU32(result, compSizes[idx])
-            this.pushU32(result, uncompSizes[idx])
-
-            this.pushU16(result, nameLength)
+            this.pushU32(result, rawSizes[idx])
+            this.pushU16(result, length(entry))
             this.pushU16(result, 0)
             this.pushU16(result, 0)
             this.pushU16(result, 0)
             this.pushU16(result, 0)
-
             this.pushU32(result, 0)
-            this.pushU32(result, localOffsets[idx])
-
-            int c = 0
-            while (c < nameLength) {
-                result.push(Byte(toInt(name[c])))
-                c = c + 1
-            }
+            this.pushU32(result, offsets[idx])
+            this.appendName(result, entry)
 
             idx = idx + 1
         }
@@ -200,982 +405,1517 @@ struct Compression {
         this.pushU32(result, centralStart)
         this.pushU16(result, 0)
 
-        return result
+        return true
     }
 
-    unzipFile(List<byte> data, string destination) bool {
-        int position = 0
+    /* ================= ZIP: extract ================= */
 
-        while (position + 4 <= data.length) {
+    private unzipBytes(List<byte> data, string destination) bool {
+        int n = data.length
+        long total = Long(n)
 
-            int sig =
-                Int(data[position]) +
-                Int(data[position + 1]) * 256 +
-                Int(data[position + 2]) * 65536 +
-                Int(data[position + 3]) * 16777216
+        if (n < 22) {
+            screen("compression: not a ZIP archive (too short)")
+            return false
+        }
 
-            if (sig != 67324752) {
-                position = data.length
-            } else {
-
-                int method =
-                    Int(data[position + 8]) +
-                    Int(data[position + 9]) * 256
-
-                int compSize =
-                    Int(data[position + 18]) +
-                    Int(data[position + 19]) * 256 +
-                    Int(data[position + 20]) * 65536 +
-                    Int(data[position + 21]) * 16777216
-
-                int nameLength =
-                    Int(data[position + 26]) +
-                    Int(data[position + 27]) * 256
-
-                int extraLength =
-                    Int(data[position + 28]) +
-                    Int(data[position + 29]) * 256
-
-                int nameStart = position + 30
-                string name = ""
-
-                int c = 0
-                while (c < nameLength) {
-                    name = name + Byte(data[nameStart + c])
-                    c = c + 1
-                }
-
-                int dataStart = nameStart + nameLength + extraLength
-
-                List<byte> payload = []
-                int p = 0
-                while (p < compSize) {
-                    payload.push(data[dataStart + p])
-                    p = p + 1
-                }
-
-                List<byte> output = []
-
-                if (method == 0) {
-                    output = payload
-                } else {
-                    output = this.deflateDecompress(payload, 0)
-                }
-
-                fs.writeFileBytes(destination + "/" + name, output)
-
-                position = dataStart + compSize
+        int eocd = -1
+        int p = n - 22
+        int lowest = n - 22 - 65535
+        if (lowest < 0) {
+            lowest = 0
+        }
+        while (eocd < 0 && p >= lowest) {
+            if (this.readU32(data, p) == 101010256L) {
+                eocd = p
             }
+            p = p - 1
+        }
+        if (eocd < 0) {
+            screen("compression: not a ZIP archive (end of central directory not found)")
+            return false
+        }
+
+        int count = this.readU16(data, eocd + 10)
+        long cdSize = this.readU32(data, eocd + 12)
+        long cdOffset = this.readU32(data, eocd + 16)
+
+        if (count == 65535 || cdSize == 4294967295L || cdOffset == 4294967295L) {
+            screen("compression: ZIP64 archives are not supported")
+            return false
+        }
+        if (cdOffset + cdSize > total) {
+            screen("compression: corrupt ZIP archive (bad central directory)")
+            return false
+        }
+
+        string base = this.trimTrailingSlash(destination)
+        fs.makeDir(base)
+
+        int pos = Int(cdOffset)
+        int idx = 0
+
+        while (idx < count) {
+            if (pos + 46 > n || this.readU32(data, pos) != 33639248L) {
+                screen("compression: corrupt ZIP archive (bad central directory entry)")
+                return false
+            }
+
+            int flags = this.readU16(data, pos + 8)
+            int method = this.readU16(data, pos + 10)
+            long crc = this.readU32(data, pos + 16)
+            long compSize = this.readU32(data, pos + 20)
+            long rawSize = this.readU32(data, pos + 24)
+            int nameLen = this.readU16(data, pos + 28)
+            int extraLen = this.readU16(data, pos + 30)
+            int commentLen = this.readU16(data, pos + 32)
+            long localOffset = this.readU32(data, pos + 42)
+
+            if (pos + 46 + nameLen > n) {
+                screen("compression: corrupt ZIP archive (truncated entry name)")
+                return false
+            }
+
+            List<byte> nameBytes = []
+            this.appendRange(nameBytes, data, pos + 46, pos + 46 + nameLen)
+            string raw = bytesToString(nameBytes)
+
+            if (!this.extractEntry(data, base, raw, flags, method, crc, compSize, rawSize, localOffset)) {
+                return false
+            }
+
+            pos = pos + 46 + nameLen + extraLen + commentLen
+            idx = idx + 1
         }
 
         return true
     }
 
-    /* ---------------- DEFLATE: stored (fast path) ---------------- */
+    private extractEntry(List<byte> data, string base, string raw, int flags, int method, long crc, long compSize, long rawSize, long localOffset) bool {
+        long total = Long(data.length)
+        string name = this.cleanName(raw)
 
-    deflateStore(List<byte> data) List<byte> {
-        List<byte> result = []
-        int position = 0
-        int length = data.length
-
-        while (position < length) {
-            int remaining = length - position
-            int blockSize = remaining
-            if (blockSize > 65535) {
-                blockSize = 65535
-            }
-
-            bool finalBlock = position + blockSize >= length
-
-            if (finalBlock) {
-                result.push(1B)
-            } else {
-                result.push(0B)
-            }
-
-            this.pushU16(result, blockSize)
-            this.pushU16(result, 65535 - blockSize)
-
-            int i = 0
-            while (i < blockSize) {
-                result.push(data[position + i])
-                i = i + 1
-            }
-
-            position = position + blockSize
+        if (!this.isSafeName(name)) {
+            screen("compression: unsafe path in archive: " + raw)
+            return false
         }
 
-        if (length == 0) {
-            result.push(1B)
-            this.pushU16(result, 0)
-            this.pushU16(result, 65535)
+        int nameLen = length(name)
+        bool isDir = asciiToInt(name[nameLen - 1]) == 47
+
+        if (isDir) {
+            this.ensureParents(base, name)
+            fs.makeDir(base + "/" + name)
+            return true
+        }
+
+        if ((flags & 1) != 0) {
+            screen("compression: encrypted entries are not supported: " + name)
+            return false
+        }
+        if (method != 0 && method != 8) {
+            screen("compression: unsupported compression method in: " + name)
+            return false
+        }
+        if (compSize > 2000000000L || rawSize > 2000000000L) {
+            screen("compression: entry too large: " + name)
+            return false
+        }
+        if (localOffset + 30L > total) {
+            screen("compression: corrupt ZIP archive (bad local header offset)")
+            return false
+        }
+
+        int lo = Int(localOffset)
+        if (this.readU32(data, lo) != 67324752L) {
+            screen("compression: corrupt ZIP archive (bad local header)")
+            return false
+        }
+
+        long dataStart = Long(lo + 30 + this.readU16(data, lo + 26) + this.readU16(data, lo + 28))
+        if (dataStart + compSize > total) {
+            screen("compression: corrupt ZIP archive (truncated data): " + name)
+            return false
+        }
+
+        int start = Int(dataStart)
+        int packedSize = Int(compSize)
+        int expectedSize = Int(rawSize)
+        List<byte> content = []
+
+        if (method == 0) {
+            if (packedSize != expectedSize) {
+                screen("compression: corrupt ZIP archive (size mismatch): " + name)
+                return false
+            }
+            this.appendRange(content, data, start, start + packedSize)
+        } else {
+            int endPos = this.inflateRange(data, start, start + packedSize, content, expectedSize)
+            if (endPos < 0) {
+                screen("compression: failed to extract: " + name)
+                return false
+            }
+        }
+
+        if (content.length != expectedSize) {
+            screen("compression: size mismatch (corrupt data): " + name)
+            return false
+        }
+        if (this.crc32(content) != crc) {
+            screen("compression: checksum mismatch (corrupt data): " + name)
+            return false
+        }
+
+        this.ensureParents(base, name)
+        fs.writeFileBytes(base + "/" + name, content)
+        return true
+    }
+
+    /* ================= Path helpers ================= */
+
+    private cleanName(string raw) string {
+        string result = ""
+        int n = length(raw)
+        int i = 0
+
+        while (i < n) {
+            int ch = asciiToInt(raw[i])
+            if (ch == 92) {
+                ch = 47
+            }
+            result = result + intToAscii(ch)
+            i = i + 1
         }
 
         return result
     }
 
-    /* ---------------- DEFLATE: LZ77 + fixed Huffman ---------------- */
+    private entryName(string raw) string {
+        string name = this.cleanName(raw)
+        int n = length(name)
+        int start = 0
+        bool again = true
 
-    hash3(List<byte> data, int pos) int {
-        int a = Int(data[pos])
-        int b = Int(data[pos + 1])
-        int c = Int(data[pos + 2])
-        return ((a * 131 + b) * 131 + c) & 32767
-    }
-
-    matchLength(List<byte> data, int a, int b, int length) int {
-        int len = 0
-        int maxLen = 258
-
-        while (len < maxLen && b + len < length && data[a + len] == data[b + len]) {
-            len = len + 1
-        }
-
-        return len
-    }
-
-    deflateCompress(List<byte> data) List<byte> {
-        List<byte> output = []
-        List<int> state = [0, 0]
-
-        this.writeBitsRaw(output, state, 1, 1)
-        this.writeBitsRaw(output, state, 1, 2)
-
-        int length = data.length
-        int hashSize = 32768
-
-        List<int> head = []
-        int hi = 0
-        while (hi < hashSize) {
-            head.push(-1)
-            hi = hi + 1
-        }
-
-        int i = 0
-
-        while (i < length) {
-            int bestLen = 0
-            int bestDist = 0
-
-            if (i + 3 <= length) {
-                int h = this.hash3(data, i)
-                int cand = head[h]
-
-                if (cand >= 0 && i - cand <= 32768) {
-                    int matchLen = this.matchLength(data, cand, i, length)
-                    if (matchLen >= 3) {
-                        bestLen = matchLen
-                        bestDist = i - cand
-                    }
-                }
-
-                head[h] = i
-            }
-
-            if (bestLen >= 3) {
-                this.writeLengthDistance(output, state, bestLen, bestDist)
-
-                int j = i + 1
-                int stop = i + bestLen
-                if (stop > length - 3) {
-                    stop = length - 3
-                }
-
-                while (j < stop) {
-                    int hh = this.hash3(data, j)
-                    head[hh] = j
-                    j = j + 1
-                }
-
-                i = i + bestLen
-            } else {
-                this.writeLiteral(output, state, Int(data[i]))
-                i = i + 1
+        while (again) {
+            again = false
+            if (start < n && asciiToInt(name[start]) == 47) {
+                start = start + 1
+                again = true
+            } else if (start + 1 < n && asciiToInt(name[start]) == 46 && asciiToInt(name[start + 1]) == 47) {
+                start = start + 2
+                again = true
             }
         }
 
-        this.writeEndOfBlock(output, state)
-        this.flushBits(output, state)
-
-        return output
-    }
-
-    deflateDecompress(List<byte> data, int startPos) List<byte> {
-        List<byte> output = []
-        List<int> state = [startPos, 0, 0]
-
-        bool finished = false
-
-        while (!finished) {
-            int bfinal = this.readBit(data, state)
-            int btype = this.readBitsLSB(data, state, 2)
-
-            if (btype == 0) {
-                state[2] = 0
-
-                int len =
-                    Int(data[state[0]]) +
-                    Int(data[state[0] + 1]) * 256
-
-                state[0] = state[0] + 4
-
-                int k = 0
-                while (k < len) {
-                    output.push(data[state[0] + k])
-                    k = k + 1
-                }
-
-                state[0] = state[0] + len
-            } else if (btype == 1) {
-                bool blockDone = false
-
-                while (!blockDone) {
-                    int symbol = this.decodeFixedSymbol(data, state)
-
-                    if (symbol == 256) {
-                        blockDone = true
-                    } else if (symbol < 256) {
-                        output.push(Byte(symbol))
-                    } else {
-                        int matchLen = this.lengthFromCode(symbol, data, state)
-                        int distCode = this.decodeDistance(data, state)
-                        int distance = this.distanceFromCode(distCode, data, state)
-
-                        int m = 0
-                        while (m < matchLen) {
-                            byte b = output[output.length - distance]
-                            output.push(b)
-                            m = m + 1
-                        }
-                    }
-                }
-            } else {
-                screen("Unsupported DEFLATE block type")
-                finished = true
-            }
-
-            if (bfinal == 1) {
-                finished = true
-            }
-        }
-
-        return output
-    }
-
-    /* ---------------- Bit I/O ---------------- */
-
-    pushBit(List<byte> output, List<int> state, int bit) void {
-        int buf = state[0]
-        int cnt = state[1]
-
-        buf = buf | (bit << cnt)
-        cnt = cnt + 1
-
-        if (cnt == 8) {
-            output.push(Byte(buf))
-            buf = 0
-            cnt = 0
-        }
-
-        state[0] = buf
-        state[1] = cnt
-    }
-
-    writeBitsRaw(List<byte> output, List<int> state, int value, int numBits) void {
-        int i = 0
-        while (i < numBits) {
-            int bit = (value >> i) & 1
-            this.pushBit(output, state, bit)
+        string result = ""
+        int i = start
+        while (i < n) {
+            result = result + intToAscii(asciiToInt(name[i]))
             i = i + 1
         }
-    }
-
-    writeHuffmanCode(List<byte> output, List<int> state, int code, int numBits) void {
-        int i = numBits - 1
-        while (i >= 0) {
-            int bit = (code >> i) & 1
-            this.pushBit(output, state, bit)
-            i = i - 1
-        }
-    }
-
-    flushBits(List<byte> output, List<int> state) void {
-        if (state[1] > 0) {
-            output.push(Byte(state[0]))
-            state[0] = 0
-            state[1] = 0
-        }
-    }
-
-    readBit(List<byte> data, List<int> state) int {
-        if (state[2] == 0) {
-            state[1] = Int(data[state[0]])
-            state[0] = state[0] + 1
-            state[2] = 8
-        }
-
-        int bit = state[1] & 1
-        state[1] = state[1] >> 1
-        state[2] = state[2] - 1
-
-        return bit
-    }
-
-    readBitsLSB(List<byte> data, List<int> state, int numBits) int {
-        int value = 0
-        int i = 0
-
-        while (i < numBits) {
-            int bit = this.readBit(data, state)
-            value = value | (bit << i)
-            i = i + 1
-        }
-
-        return value
-    }
-
-    /* ---------------- Fixed Huffman literal/length ---------------- */
-
-    writeLiteral(List<byte> output, List<int> state, int value) void {
-        if (value <= 143) {
-            this.writeHuffmanCode(output, state, 48 + value, 8)
-        } else {
-            this.writeHuffmanCode(output, state, 400 + (value - 144), 9)
-        }
-    }
-
-    writeEndOfBlock(List<byte> output, List<int> state) void {
-        this.writeHuffmanCode(output, state, 0, 7)
-    }
-
-    decodeFixedSymbol(List<byte> data, List<int> state) int {
-        int code = 0
-        int len = 0
-        int result = -1
-
-        while (result == -1) {
-            int bit = this.readBit(data, state)
-            code = (code << 1) | bit
-            len = len + 1
-
-            if (len == 7 && code <= 23) {
-                result = code + 256
-            } else if (len == 8 && code >= 48 && code <= 191) {
-                result = code - 48
-            } else if (len == 8 && code >= 192 && code <= 199) {
-                result = code - 192 + 280
-            } else if (len == 9 && code >= 400 && code <= 511) {
-                result = code - 400 + 144
-            }
-        }
-
         return result
     }
 
-    decodeDistance(List<byte> data, List<int> state) int {
-        int code = 0
+    private isSafeName(string name) bool {
+        int n = length(name)
+        if (n == 0) {
+            return false
+        }
+        if (asciiToInt(name[0]) == 47) {
+            return false
+        }
+        if (n >= 2 && asciiToInt(name[1]) == 58) {
+            return false
+        }
+
+        int segLen = 0
+        int segDots = 0
         int i = 0
 
-        while (i < 5) {
-            int bit = this.readBit(data, state)
-            code = (code << 1) | bit
+        while (i <= n) {
+            int ch = 47
+            if (i < n) {
+                ch = asciiToInt(name[i])
+            }
+            if (ch == 0) {
+                return false
+            }
+            if (ch == 47) {
+                if (segLen == 2 && segDots == 2) {
+                    return false
+                }
+                segLen = 0
+                segDots = 0
+            } else {
+                segLen = segLen + 1
+                if (ch == 46) {
+                    segDots = segDots + 1
+                }
+            }
             i = i + 1
         }
 
-        return code
+        return true
     }
 
-    writeLengthDistance(List<byte> output, List<int> state, int matchLength, int distance) void {
-        int llCode = 0
-        int extraBits = 0
-        int extraValue = 0
+    private trimTrailingSlash(string path) string {
+        int n = length(path)
+        while (n > 1 && asciiToInt(path[n - 1]) == 47) {
+            n = n - 1
+        }
+        string result = ""
+        int i = 0
+        while (i < n) {
+            result = result + intToAscii(asciiToInt(path[i]))
+            i = i + 1
+        }
+        return result
+    }
 
-        if (matchLength == 258) {
-            llCode = 285
-            extraBits = 0
-            extraValue = 0
-        }
-        else if (matchLength >= 227) {
-            llCode = 284
-            extraBits = 5
-            extraValue = matchLength - 227
-        }
-        else if (matchLength >= 195) {
-            llCode = 283
-            extraBits = 5
-            extraValue = matchLength - 195
-        }
-        else if (matchLength >= 163) {
-            llCode = 282
-            extraBits = 5
-            extraValue = matchLength - 163
-        }
-        else if (matchLength >= 131) {
-            llCode = 281
-            extraBits = 5
-            extraValue = matchLength - 131
-        }
-        else if (matchLength >= 115) {
-            llCode = 280
-            extraBits = 4
-            extraValue = matchLength - 115
-        }
-        else if (matchLength >= 99) {
-            llCode = 279
-            extraBits = 4
-            extraValue = matchLength - 99
-        }
-        else if (matchLength >= 83) {
-            llCode = 278
-            extraBits = 4
-            extraValue = matchLength - 83
-        }
-        else if (matchLength >= 67) {
-            llCode = 277
-            extraBits = 4
-            extraValue = matchLength - 67
-        }
-        else if (matchLength >= 59) {
-            llCode = 276
-            extraBits = 3
-            extraValue = matchLength - 59
-        }
-        else if (matchLength >= 51) {
-            llCode = 275
-            extraBits = 3
-            extraValue = matchLength - 51
-        }
-        else if (matchLength >= 43) {
-            llCode = 274
-            extraBits = 3
-            extraValue = matchLength - 43
-        }
-        else if (matchLength >= 35) {
-            llCode = 273
-            extraBits = 3
-            extraValue = matchLength - 35
-        }
-        else if (matchLength >= 31) {
-            llCode = 272
-            extraBits = 2
-            extraValue = matchLength - 31
-        }
-        else if (matchLength >= 27) {
-            llCode = 271
-            extraBits = 2
-            extraValue = matchLength - 27
-        }
-        else if (matchLength >= 23) {
-            llCode = 270
-            extraBits = 2
-            extraValue = matchLength - 23
-        }
-        else if (matchLength >= 19) {
-            llCode = 269
-            extraBits = 2
-            extraValue = matchLength - 19
-        }
-        else if (matchLength >= 17) {
-            llCode = 268
-            extraBits = 1
-            extraValue = matchLength - 17
-        }
-        else if (matchLength >= 15) {
-            llCode = 267
-            extraBits = 1
-            extraValue = matchLength - 15
-        }
-        else if (matchLength >= 13) {
-            llCode = 266
-            extraBits = 1
-            extraValue = matchLength - 13
-        }
-        else if (matchLength >= 11) {
-            llCode = 265
-            extraBits = 1
-            extraValue = matchLength - 11
-        }
-        else if (matchLength == 10) {
-            llCode = 264
-        }
-        else if (matchLength == 9) {
-            llCode = 263
-        }
-        else if (matchLength == 8) {
-            llCode = 262
-        }
-        else if (matchLength == 7) {
-            llCode = 261
-        }
-        else if (matchLength == 6) {
-            llCode = 260
-        }
-        else if (matchLength == 5) {
-            llCode = 259
-        }
-        else if (matchLength == 4) {
-            llCode = 258
-        }
-        else {
-            llCode = 257
-        }
+    private ensureParents(string base, string name) void {
+        string prefix = ""
+        int n = length(name)
+        int i = 0
 
-        if (llCode <= 279) {
-            this.writeHuffmanCode(output, state, llCode - 256, 7)
-        } else {
-            this.writeHuffmanCode(output, state, 192 + (llCode - 280), 8)
-        }
-
-        if (extraBits > 0) {
-            this.writeBitsRaw(output, state, extraValue, extraBits)
-        }
-
-        int distCode = 0
-        int distExtraBits = 0
-        int distExtraValue = 0
-
-        if (distance <= 4) {
-            distCode = distance - 1
-            distExtraBits = 0
-            distExtraValue = 0
-        }
-        else if (distance <= 6) {
-            distCode = 4
-            distExtraBits = 1
-            distExtraValue = distance - 5
-        }
-        else if (distance <= 8) {
-            distCode = 5
-            distExtraBits = 1
-            distExtraValue = distance - 7
-        }
-        else if (distance <= 12) {
-            distCode = 6
-            distExtraBits = 2
-            distExtraValue = distance - 9
-        }
-        else if (distance <= 16) {
-            distCode = 7
-            distExtraBits = 2
-            distExtraValue = distance - 13
-        }
-        else if (distance <= 24) {
-            distCode = 8
-            distExtraBits = 3
-            distExtraValue = distance - 17
-        }
-        else if (distance <= 32) {
-            distCode = 9
-            distExtraBits = 3
-            distExtraValue = distance - 25
-        }
-        else if (distance <= 48) {
-            distCode = 10
-            distExtraBits = 4
-            distExtraValue = distance - 33
-        }
-        else if (distance <= 64) {
-            distCode = 11
-            distExtraBits = 4
-            distExtraValue = distance - 49
-        }
-        else if (distance <= 96) {
-            distCode = 12
-            distExtraBits = 5
-            distExtraValue = distance - 65
-        }
-        else if (distance <= 128) {
-            distCode = 13
-            distExtraBits = 5
-            distExtraValue = distance - 97
-        }
-        else if (distance <= 192) {
-            distCode = 14
-            distExtraBits = 6
-            distExtraValue = distance - 129
-        }
-        else if (distance <= 256) {
-            distCode = 15
-            distExtraBits = 6
-            distExtraValue = distance - 193
-        }
-        else if (distance <= 384) {
-            distCode = 16
-            distExtraBits = 7
-            distExtraValue = distance - 257
-        }
-        else if (distance <= 512) {
-            distCode = 17
-            distExtraBits = 7
-            distExtraValue = distance - 385
-        }
-        else if (distance <= 768) {
-            distCode = 18
-            distExtraBits = 8
-            distExtraValue = distance - 513
-        }
-        else if (distance <= 1024) {
-            distCode = 19
-            distExtraBits = 8
-            distExtraValue = distance - 769
-        }
-        else if (distance <= 1536) {
-            distCode = 20
-            distExtraBits = 9
-            distExtraValue = distance - 1025
-        }
-        else if (distance <= 2048) {
-            distCode = 21
-            distExtraBits = 9
-            distExtraValue = distance - 1537
-        }
-        else if (distance <= 3072) {
-            distCode = 22
-            distExtraBits = 10
-            distExtraValue = distance - 2049
-        }
-        else if (distance <= 4096) {
-            distCode = 23
-            distExtraBits = 10
-            distExtraValue = distance - 3073
-        }
-        else if (distance <= 6144) {
-            distCode = 24
-            distExtraBits = 11
-            distExtraValue = distance - 4097
-        }
-        else if (distance <= 8192) {
-            distCode = 25
-            distExtraBits = 11
-            distExtraValue = distance - 6145
-        }
-        else if (distance <= 12288) {
-            distCode = 26
-            distExtraBits = 12
-            distExtraValue = distance - 8193
-        }
-        else if (distance <= 16384) {
-            distCode = 27
-            distExtraBits = 12
-            distExtraValue = distance - 12289
-        }
-        else if (distance <= 24576) {
-            distCode = 28
-            distExtraBits = 13
-            distExtraValue = distance - 16385
-        }
-        else {
-            distCode = 29
-            distExtraBits = 13
-            distExtraValue = distance - 24577
-        }
-
-        this.writeHuffmanCode(output, state, distCode, 5)
-
-        if (distExtraBits > 0) {
-            this.writeBitsRaw(output, state, distExtraValue, distExtraBits)
+        while (i < n) {
+            int ch = asciiToInt(name[i])
+            if (ch == 47 && i > 0) {
+                fs.makeDir(base + "/" + prefix)
+            }
+            prefix = prefix + intToAscii(ch)
+            i = i + 1
         }
     }
 
-    lengthFromCode(int llCode, List<byte> data, List<int> state) int {
-        if (llCode == 285) {
-            return 258
-        }
-
-        int base = 0
-        int extraBits = 0
-
-        if (llCode == 284) {
-            base = 227
-            extraBits = 5
-        }
-        else if (llCode == 283) {
-            base = 195
-            extraBits = 5
-        }
-        else if (llCode == 282) {
-            base = 163
-            extraBits = 5
-        }
-        else if (llCode == 281) {
-            base = 131
-            extraBits = 5
-        }
-        else if (llCode == 280) {
-            base = 115
-            extraBits = 4
-        }
-        else if (llCode == 279) {
-            base = 99
-            extraBits = 4
-        }
-        else if (llCode == 278) {
-            base = 83
-            extraBits = 4
-        }
-        else if (llCode == 277) {
-            base = 67
-            extraBits = 4
-        }
-        else if (llCode == 276) {
-            base = 59
-            extraBits = 3
-        }
-        else if (llCode == 275) {
-            base = 51
-            extraBits = 3
-        }
-        else if (llCode == 274) {
-            base = 43
-            extraBits = 3
-        }
-        else if (llCode == 273) {
-            base = 35
-            extraBits = 3
-        }
-        else if (llCode == 272) {
-            base = 31
-            extraBits = 2
-        }
-        else if (llCode == 271) {
-            base = 27
-            extraBits = 2
-        }
-        else if (llCode == 270) {
-            base = 23
-            extraBits = 2
-        }
-        else if (llCode == 269) {
-            base = 19
-            extraBits = 2
-        }
-        else if (llCode == 268) {
-            base = 17
-            extraBits = 1
-        }
-        else if (llCode == 267) {
-            base = 15
-            extraBits = 1
-        }
-        else if (llCode == 266) {
-            base = 13
-            extraBits = 1
-        }
-        else if (llCode == 265) {
-            base = 11
-            extraBits = 1
-        }
-        else if (llCode == 264) {
-            base = 10
-            extraBits = 0
-        }
-        else if (llCode == 263) {
-            base = 9
-            extraBits = 0
-        }
-        else if (llCode == 262) {
-            base = 8
-            extraBits = 0
-        }
-        else if (llCode == 261) {
-            base = 7
-            extraBits = 0
-        }
-        else if (llCode == 260) {
-            base = 6
-            extraBits = 0
-        }
-        else if (llCode == 259) {
-            base = 5
-            extraBits = 0
-        }
-        else if (llCode == 258) {
-            base = 4
-            extraBits = 0
-        }
-        else {
-            base = 3
-            extraBits = 0
-        }
-
-        int extra = 0
-        if (extraBits > 0) {
-            extra = this.readBitsLSB(data, state, extraBits)
-        }
-
-        return base + extra
+    private appendName(List<byte> output, string name) void {
+        List<byte> nameBytes = stringToBytes(name)
+        this.appendRange(output, nameBytes, 0, nameBytes.length)
     }
 
-    distanceFromCode(int distCode, List<byte> data, List<int> state) int {
-        int base = 0
-        int extraBits = 0
-
-        if (distCode == 0) {
-            base = 1
-            extraBits = 0
+    private appendRange(List<byte> destination, List<byte> source, int start, int end) void {
+        int i = start
+        while (i < end) {
+            destination.push(source[i])
+            i = i + 1
         }
-        else if (distCode == 1) {
-            base = 2
-            extraBits = 0
-        }
-        else if (distCode == 2) {
-            base = 3
-            extraBits = 0
-        }
-        else if (distCode == 3) {
-            base = 4
-            extraBits = 0
-        }
-        else if (distCode == 4) {
-            base = 5
-            extraBits = 1
-        }
-        else if (distCode == 5) {
-            base = 7
-            extraBits = 1
-        }
-        else if (distCode == 6) {
-            base = 9
-            extraBits = 2
-        }
-        else if (distCode == 7) {
-            base = 13
-            extraBits = 2
-        }
-        else if (distCode == 8) {
-            base = 17
-            extraBits = 3
-        }
-        else if (distCode == 9) {
-            base = 25
-            extraBits = 3
-        }
-        else if (distCode == 10) {
-            base = 33
-            extraBits = 4
-        }
-        else if (distCode == 11) {
-            base = 49
-            extraBits = 4
-        }
-        else if (distCode == 12) {
-            base = 65
-            extraBits = 5
-        }
-        else if (distCode == 13) {
-            base = 97
-            extraBits = 5
-        }
-        else if (distCode == 14) {
-            base = 129
-            extraBits = 6
-        }
-        else if (distCode == 15) {
-            base = 193
-            extraBits = 6
-        }
-        else if (distCode == 16) {
-            base = 257
-            extraBits = 7
-        }
-        else if (distCode == 17) {
-            base = 385
-            extraBits = 7
-        }
-        else if (distCode == 18) {
-            base = 513
-            extraBits = 8
-        }
-        else if (distCode == 19) {
-            base = 769
-            extraBits = 8
-        }
-        else if (distCode == 20) {
-            base = 1025
-            extraBits = 9
-        }
-        else if (distCode == 21) {
-            base = 1537
-            extraBits = 9
-        }
-        else if (distCode == 22) {
-            base = 2049
-            extraBits = 10
-        }
-        else if (distCode == 23) {
-            base = 3073
-            extraBits = 10
-        }
-        else if (distCode == 24) {
-            base = 4097
-            extraBits = 11
-        }
-        else if (distCode == 25) {
-            base = 6145
-            extraBits = 11
-        }
-        else if (distCode == 26) {
-            base = 8193
-            extraBits = 12
-        }
-        else if (distCode == 27) {
-            base = 12289
-            extraBits = 12
-        }
-        else if (distCode == 28) {
-            base = 16385
-            extraBits = 13
-        }
-        else {
-            base = 24577
-            extraBits = 13
-        }
-
-        int extra = 0
-        if (extraBits > 0) {
-            extra = this.readBitsLSB(data, state, extraBits)
-        }
-
-        return base + extra
     }
 
-    /* ---------------- Helpers ---------------- */
+    private skipZeroTerminated(List<byte> data, int pos) int {
+        int n = data.length
+        int i = pos
+        while (i < n) {
+            if (data[i] == 0B) {
+                return i + 1
+            }
+            i = i + 1
+        }
+        return -1
+    }
 
-    pushU16(List<byte> output, long value) void {
+    /* ================= Small helpers ================= */
+
+    private clampLevel(int level) int {
+        if (level < 0) {
+            return 0
+        }
+        if (level > 9) {
+            return 9
+        }
+        return level
+    }
+
+    private maxOutput() int {
+        return 2000000000
+    }
+
+    private zeros(int n) List<int> {
+        List<int> result = []
+        int i = 0
+        while (i < n) {
+            result.push(0)
+            i = i + 1
+        }
+        return result
+    }
+
+    private filled(int n, int value) List<int> {
+        List<int> result = []
+        int i = 0
+        while (i < n) {
+            result.push(value)
+            i = i + 1
+        }
+        return result
+    }
+
+    private pushU16(List<byte> output, int value) void {
         output.push(Byte(value % 256))
         output.push(Byte((value / 256) % 256))
     }
 
-    pushU32(List<byte> output, long value) void {
+    private pushU32(List<byte> output, int value) void {
         output.push(Byte(value % 256))
         output.push(Byte((value / 256) % 256))
         output.push(Byte((value / 65536) % 256))
         output.push(Byte((value / 16777216) % 256))
     }
 
-    crc32(List<byte> data) long {
-        long crc = 4294967295L
+    private pushU32L(List<byte> output, long value) void {
+        output.push(Byte(Int(value % 256L)))
+        output.push(Byte(Int((value / 256L) % 256L)))
+        output.push(Byte(Int((value / 65536L) % 256L)))
+        output.push(Byte(Int((value / 16777216L) % 256L)))
+    }
 
-        int i = 0
+    private pushU32BE(List<byte> output, long value) void {
+        output.push(Byte(Int((value / 16777216L) % 256L)))
+        output.push(Byte(Int((value / 65536L) % 256L)))
+        output.push(Byte(Int((value / 256L) % 256L)))
+        output.push(Byte(Int(value % 256L)))
+    }
 
-        while (i < data.length) {
-            crc = crc ^ Int(data[i])
+    private readU16(List<byte> data, int pos) int {
+        return (Int(data[pos]) & 255) + (Int(data[pos + 1]) & 255) * 256
+    }
 
-            int bit = 0
+    private readU32(List<byte> data, int pos) long {
+        long b0 = Long((Int(data[pos]) & 255))
+        long b1 = Long((Int(data[pos + 1]) & 255))
+        long b2 = Long((Int(data[pos + 2]) & 255))
+        long b3 = Long((Int(data[pos + 3]) & 255))
+        return b0 + b1 * 256L + b2 * 65536L + b3 * 16777216L
+    }
 
-            while (bit < 8) {
-                if ((crc & 1) != 0) {
-                    crc = (crc >> 1) ^ 3988292384L
-                } else {
-                    crc = crc >> 1
-                }
-                bit = bit + 1
+    private readU32BE(List<byte> data, int pos) long {
+        long b0 = Long((Int(data[pos]) & 255))
+        long b1 = Long((Int(data[pos + 1]) & 255))
+        long b2 = Long((Int(data[pos + 2]) & 255))
+        long b3 = Long((Int(data[pos + 3]) & 255))
+        return b0 * 16777216L + b1 * 65536L + b2 * 256L + b3
+    }
+
+    /* ================= DEFLATE tables ================= */
+
+    private lengthBase() List<int> {
+        return [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+    }
+
+    private lengthExtra() List<int> {
+        return [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+    }
+
+    private distBase() List<int> {
+        return [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+    }
+
+    private distExtra() List<int> {
+        return [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+    }
+
+    private codeLengthOrder() List<int> {
+        return [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+    }
+
+    /* match length (3..258) -> length code index (0..28) */
+    private lengthCodeTable() List<int> {
+        List<int> base = this.lengthBase()
+        List<int> extra = this.lengthExtra()
+        List<int> table = this.zeros(259)
+        int c = 0
+
+        while (c < 29) {
+            int span = 1 << extra[c]
+            int l = base[c]
+            int stop = base[c] + span
+            while (l < stop && l <= 258) {
+                table[l] = c
+                l = l + 1
+            }
+            c = c + 1
+        }
+
+        return table
+    }
+
+    private distCode(int dist, List<int> distBaseTable) int {
+        int c = 29
+        while (c > 0 && distBaseTable[c] > dist) {
+            c = c - 1
+        }
+        return c
+    }
+
+    /* ================= INFLATE ================= */
+
+    /*
+        Decodes a raw DEFLATE stream from data[start..end) and appends it to output.
+        Fails if the output list would grow beyond limit.
+        Returns the position just after the stream, or -1 on error.
+        State list: [0] byte position, [1] bit buffer, [2] bit count, [3] error flag.
+    */
+    private inflateRange(List<byte> data, int start, int end, List<byte> output, int limit) int {
+        List<int> st = [start, 0, 0, 0]
+        bool last = false
+
+        while (!last) {
+            int bfinal = this.getBits(data, end, st, 1)
+            int btype = this.getBits(data, end, st, 2)
+
+            if (st[3] != 0) {
+                screen("compression: truncated data")
+                return -1
+            }
+            if (bfinal == 1) {
+                last = true
             }
 
+            bool ok = false
+            if (btype == 0) {
+                ok = this.inflateStored(data, end, st, output, limit)
+            } else if (btype == 1) {
+                ok = this.inflateFixed(data, end, st, output, limit)
+            } else if (btype == 2) {
+                ok = this.inflateDynamic(data, end, st, output, limit)
+            } else {
+                screen("compression: invalid block type")
+                return -1
+            }
+
+            if (!ok) {
+                return -1
+            }
+        }
+
+        return st[0]
+    }
+
+    private getBits(List<byte> data, int end, List<int> st, int need) int {
+        int val = st[1]
+        int cnt = st[2]
+
+        while (cnt < need) {
+            if (st[0] >= end) {
+                st[3] = 1
+                return 0
+            }
+            val = val | ((Int(data[st[0]]) & 255) << cnt)
+            st[0] = st[0] + 1
+            cnt = cnt + 8
+        }
+
+        st[1] = val >> need
+        st[2] = cnt - need
+        return val & ((1 << need) - 1)
+    }
+
+    private inflateStored(List<byte> data, int end, List<int> st, List<byte> output, int limit) bool {
+        st[1] = 0
+        st[2] = 0
+
+        int p = st[0]
+        if (p + 4 > end) {
+            screen("compression: truncated data")
+            return false
+        }
+
+        int blockLen = this.readU16(data, p)
+        int blockInv = this.readU16(data, p + 2)
+        if (blockLen != 65535 - blockInv) {
+            screen("compression: corrupt stored block")
+            return false
+        }
+
+        p = p + 4
+        if (p + blockLen > end) {
+            screen("compression: truncated data")
+            return false
+        }
+        if (output.length + blockLen > limit) {
+            screen("compression: output exceeds expected size")
+            return false
+        }
+
+        this.appendRange(output, data, p, p + blockLen)
+        st[0] = p + blockLen
+        return true
+    }
+
+    private inflateFixed(List<byte> data, int end, List<int> st, List<byte> output, int limit) bool {
+        List<int> lens = []
+        int i = 0
+        while (i < 288) {
+            if (i < 144) {
+                lens.push(8)
+            } else if (i < 256) {
+                lens.push(9)
+            } else if (i < 280) {
+                lens.push(7)
+            } else {
+                lens.push(8)
+            }
             i = i + 1
         }
 
-        return crc ^ 4294967295L
+        List<int> lcounts = this.zeros(16)
+        List<int> lsyms = this.zeros(288)
+        this.buildDecoder(lens, 288, lcounts, lsyms)
+
+        List<int> dlens = this.filled(30, 5)
+        List<int> dcounts = this.zeros(16)
+        List<int> dsyms = this.zeros(30)
+        this.buildDecoder(dlens, 30, dcounts, dsyms)
+
+        return this.inflateCodes(data, end, st, output, limit, lcounts, lsyms, dcounts, dsyms)
+    }
+
+    private inflateDynamic(List<byte> data, int end, List<int> st, List<byte> output, int limit) bool {
+        int nlen = this.getBits(data, end, st, 5) + 257
+        int ndist = this.getBits(data, end, st, 5) + 1
+        int ncode = this.getBits(data, end, st, 4) + 4
+
+        if (st[3] != 0) {
+            screen("compression: truncated data")
+            return false
+        }
+        if (nlen > 286 || ndist > 30) {
+            screen("compression: corrupt dynamic block header")
+            return false
+        }
+
+        List<int> order = this.codeLengthOrder()
+        List<int> lengths = this.zeros(320)
+        int i = 0
+        while (i < ncode) {
+            lengths[order[i]] = this.getBits(data, end, st, 3)
+            i = i + 1
+        }
+        if (st[3] != 0) {
+            screen("compression: truncated data")
+            return false
+        }
+
+        List<int> ccounts = this.zeros(16)
+        List<int> csyms = this.zeros(19)
+        int err = this.buildDecoder(lengths, 19, ccounts, csyms)
+        if (err != 0) {
+            screen("compression: corrupt code length table")
+            return false
+        }
+
+        i = 0
+        while (i < 19) {
+            lengths[i] = 0
+            i = i + 1
+        }
+
+        int wanted = nlen + ndist
+        int index = 0
+        while (index < wanted) {
+            int sym = this.decodeSymbol(data, end, st, ccounts, csyms)
+            if (sym < 0) {
+                screen("compression: corrupt data (bad code length symbol)")
+                return false
+            }
+
+            if (sym < 16) {
+                lengths[index] = sym
+                index = index + 1
+            } else {
+                int prev = 0
+                int rep = 0
+                if (sym == 16) {
+                    if (index == 0) {
+                        screen("compression: corrupt code length repeat")
+                        return false
+                    }
+                    prev = lengths[index - 1]
+                    rep = 3 + this.getBits(data, end, st, 2)
+                } else if (sym == 17) {
+                    rep = 3 + this.getBits(data, end, st, 3)
+                } else {
+                    rep = 11 + this.getBits(data, end, st, 7)
+                }
+                if (st[3] != 0) {
+                    screen("compression: truncated data")
+                    return false
+                }
+                if (index + rep > wanted) {
+                    screen("compression: corrupt code length repeat")
+                    return false
+                }
+                while (rep > 0) {
+                    lengths[index] = prev
+                    index = index + 1
+                    rep = rep - 1
+                }
+            }
+        }
+
+        if (lengths[256] == 0) {
+            screen("compression: corrupt block (no end-of-block code)")
+            return false
+        }
+
+        List<int> llens = this.zeros(nlen)
+        i = 0
+        while (i < nlen) {
+            llens[i] = lengths[i]
+            i = i + 1
+        }
+        List<int> dlens = this.zeros(ndist)
+        i = 0
+        while (i < ndist) {
+            dlens[i] = lengths[nlen + i]
+            i = i + 1
+        }
+
+        List<int> lcounts = this.zeros(16)
+        List<int> lsyms = this.zeros(nlen)
+        err = this.buildDecoder(llens, nlen, lcounts, lsyms)
+        if (err < 0 || (err > 0 && nlen != lcounts[0] + lcounts[1])) {
+            screen("compression: corrupt literal/length table")
+            return false
+        }
+
+        List<int> dcounts = this.zeros(16)
+        List<int> dsyms = this.zeros(ndist)
+        err = this.buildDecoder(dlens, ndist, dcounts, dsyms)
+        if (err < 0 || (err > 0 && ndist != dcounts[0] + dcounts[1])) {
+            screen("compression: corrupt distance table")
+            return false
+        }
+
+        return this.inflateCodes(data, end, st, output, limit, lcounts, lsyms, dcounts, dsyms)
+    }
+
+    /*
+        Builds a canonical Huffman decoder (counts per length + symbols in code order).
+        Returns 0 if complete, > 0 if incomplete, < 0 if over-subscribed.
+    */
+    private buildDecoder(List<int> lengths, int n, List<int> counts, List<int> symbols) int {
+        int i = 0
+        while (i < 16) {
+            counts[i] = 0
+            i = i + 1
+        }
+        i = 0
+        while (i < n) {
+            counts[lengths[i]] = counts[lengths[i]] + 1
+            i = i + 1
+        }
+        if (counts[0] == n) {
+            return 0
+        }
+
+        int left = 1
+        int bits = 1
+        while (bits <= 15) {
+            left = left * 2
+            left = left - counts[bits]
+            if (left < 0) {
+                return left
+            }
+            bits = bits + 1
+        }
+
+        List<int> offs = this.zeros(16)
+        bits = 1
+        while (bits < 15) {
+            offs[bits + 1] = offs[bits] + counts[bits]
+            bits = bits + 1
+        }
+
+        i = 0
+        while (i < n) {
+            if (lengths[i] != 0) {
+                symbols[offs[lengths[i]]] = i
+                offs[lengths[i]] = offs[lengths[i]] + 1
+            }
+            i = i + 1
+        }
+
+        return left
+    }
+
+    private decodeSymbol(List<byte> data, int end, List<int> st, List<int> counts, List<int> symbols) int {
+        int pos = st[0]
+        int buf = st[1]
+        int cnt = st[2]
+
+        int code = 0
+        int first = 0
+        int index = 0
+        int bits = 1
+        int result = -1
+        bool done = false
+
+        while (!done && bits <= 15) {
+            if (cnt == 0) {
+                if (pos >= end) {
+                    st[3] = 1
+                    done = true
+                } else {
+                    buf = (Int(data[pos]) & 255)
+                    pos = pos + 1
+                    cnt = 8
+                }
+            }
+
+            if (!done) {
+                code = code | (buf & 1)
+                buf = buf >> 1
+                cnt = cnt - 1
+
+                int count = counts[bits]
+                if (code - count < first) {
+                    result = symbols[index + (code - first)]
+                    done = true
+                } else {
+                    index = index + count
+                    first = first + count
+                    first = first * 2
+                    code = code * 2
+                    bits = bits + 1
+                }
+            }
+        }
+
+        st[0] = pos
+        st[1] = buf
+        st[2] = cnt
+        return result
+    }
+
+    private inflateCodes(List<byte> data, int end, List<int> st, List<byte> output, int limit, List<int> lcounts, List<int> lsyms, List<int> dcounts, List<int> dsyms) bool {
+        List<int> lenBase = this.lengthBase()
+        List<int> lenExtra = this.lengthExtra()
+        List<int> dBase = this.distBase()
+        List<int> dExtra = this.distExtra()
+
+        bool done = false
+        while (!done) {
+            int sym = this.decodeSymbol(data, end, st, lcounts, lsyms)
+            if (sym < 0) {
+                screen("compression: corrupt or truncated data (literal/length code)")
+                return false
+            }
+
+            if (sym < 256) {
+                if (output.length >= limit) {
+                    screen("compression: output exceeds expected size")
+                    return false
+                }
+                output.push(Byte(sym))
+            } else if (sym == 256) {
+                done = true
+            } else {
+                int li = sym - 257
+                if (li >= 29) {
+                    screen("compression: corrupt data (invalid length symbol)")
+                    return false
+                }
+                int mlen = lenBase[li] + this.getBits(data, end, st, lenExtra[li])
+
+                int dsym = this.decodeSymbol(data, end, st, dcounts, dsyms)
+                if (dsym < 0 || dsym >= 30) {
+                    screen("compression: corrupt or truncated data (distance code)")
+                    return false
+                }
+                int dist = dBase[dsym] + this.getBits(data, end, st, dExtra[dsym])
+
+                if (st[3] != 0) {
+                    screen("compression: truncated data")
+                    return false
+                }
+                if (dist > output.length) {
+                    screen("compression: corrupt data (distance too far back)")
+                    return false
+                }
+                if (output.length + mlen > limit) {
+                    screen("compression: output exceeds expected size")
+                    return false
+                }
+
+                int src = output.length - dist
+                int k = 0
+                while (k < mlen) {
+                    output.push(output[src + k])
+                    k = k + 1
+                }
+            }
+        }
+
+        return true
+    }
+
+    /* ================= DEFLATE: compress ================= */
+
+    private chainLimit(int level) int {
+        List<int> table = [0, 4, 8, 16, 16, 32, 128, 256, 1024, 4096]
+        return table[level]
+    }
+
+    private niceLength(int level) int {
+        List<int> table = [0, 16, 32, 64, 32, 64, 128, 128, 258, 258]
+        return table[level]
+    }
+
+    /* Appends a complete raw DEFLATE stream for data to output. level is 0..9. */
+    private deflateInto(List<byte> data, int level, List<byte> output) void {
+        List<int> bw = [0, 0]
+        int n = data.length
+
+        if (level == 0 || n == 0) {
+            this.writeStored(output, bw, data, 0, n, true)
+            this.flushBits(output, bw)
+            return
+        }
+
+        int blockTokens = 32768
+        List<int> tokA = this.zeros(blockTokens + 1024)
+        List<int> tokB = this.zeros(blockTokens + 1024)
+        int tc = 0
+
+        List<int> head = this.filled(32768, -1)
+        List<int> prev = this.zeros(32768)
+        List<int> ms = [0, 0]
+
+        int chain = this.chainLimit(level)
+        int nice = this.niceLength(level)
+        bool lazy = level >= 4
+
+        int blockStart = 0
+        int i = 0
+
+        while (i < n) {
+            if (tc >= blockTokens) {
+                this.writeBlock(output, bw, data, blockStart, i, tokA, tokB, tc, false)
+                blockStart = i
+                tc = 0
+            }
+
+            this.insertUpTo(data, n, head, prev, ms, i)
+            int mlen = this.findMatch(data, n, head, prev, i, chain, nice, ms)
+            int mdist = ms[1]
+
+            if (lazy && mlen >= 3 && mlen < nice && i + 1 < n) {
+                bool searching = true
+                while (searching) {
+                    this.insertUpTo(data, n, head, prev, ms, i + 1)
+                    int mlen2 = this.findMatch(data, n, head, prev, i + 1, chain, nice, ms)
+                    if (mlen2 > mlen) {
+                        tokA[tc] = (Int(data[i]) & 255)
+                        tokB[tc] = 0
+                        tc = tc + 1
+                        i = i + 1
+                        mlen = mlen2
+                        mdist = ms[1]
+                        if (mlen >= nice || i + 1 >= n) {
+                            searching = false
+                        }
+                    } else {
+                        searching = false
+                    }
+                }
+            }
+
+            if (mlen >= 3) {
+                tokA[tc] = mlen
+                tokB[tc] = mdist
+                tc = tc + 1
+                i = i + mlen
+            } else {
+                tokA[tc] = (Int(data[i]) & 255)
+                tokB[tc] = 0
+                tc = tc + 1
+                i = i + 1
+            }
+        }
+
+        this.writeBlock(output, bw, data, blockStart, n, tokA, tokB, tc, true)
+        this.flushBits(output, bw)
+    }
+
+    private hash3(List<byte> data, int pos) int {
+        long v = Long((Int(data[pos]) & 255) * 65536 + (Int(data[pos + 1]) & 255) * 256 + (Int(data[pos + 2]) & 255))
+        long h = (v * 2654435761L) & 4294967295L
+        return Int(h >> 17L)
+    }
+
+    /* Inserts every position below target into the hash chains. ms[0] = next position to insert. */
+    private insertUpTo(List<byte> data, int n, List<int> head, List<int> prev, List<int> ms, int target) void {
+        int p = ms[0]
+        while (p < target) {
+            if (p + 3 <= n) {
+                int h = this.hash3(data, p)
+                prev[p & 32767] = head[h]
+                head[h] = p
+            }
+            p = p + 1
+        }
+        ms[0] = p
+    }
+
+    private matchLength(List<byte> data, int a, int b, int maxLen) int {
+        int l = 0
+        while (l < maxLen && data[a + l] == data[b + l]) {
+            l = l + 1
+        }
+        return l
+    }
+
+    /* Returns the best match length at pos (0 if none) and stores its distance in ms[1]. */
+    private findMatch(List<byte> data, int n, List<int> head, List<int> prev, int pos, int chain, int nice, List<int> ms) int {
+        ms[1] = 0
+        if (pos + 3 > n) {
+            return 0
+        }
+
+        int maxLen = 258
+        if (n - pos < maxLen) {
+            maxLen = n - pos
+        }
+
+        int cand = head[this.hash3(data, pos)]
+        int bestLen = 0
+        int bestDist = 0
+        int tries = chain
+        bool going = true
+
+        while (going && cand >= 0 && tries > 0) {
+            int dist = pos - cand
+            if (dist > 32768 || dist <= 0) {
+                going = false
+            } else {
+                if (data[cand + bestLen] == data[pos + bestLen]) {
+                    int l = this.matchLength(data, cand, pos, maxLen)
+                    if (l > bestLen) {
+                        bestLen = l
+                        bestDist = dist
+                        if (l >= nice || l >= maxLen) {
+                            going = false
+                        }
+                    }
+                }
+                if (going) {
+                    int nxt = prev[cand & 32767]
+                    if (nxt >= cand) {
+                        going = false
+                    } else {
+                        cand = nxt
+                    }
+                    tries = tries - 1
+                }
+            }
+        }
+
+        if (bestLen < 3) {
+            return 0
+        }
+        if (bestLen == 3 && bestDist > 4096) {
+            return 0
+        }
+
+        ms[1] = bestDist
+        return bestLen
+    }
+
+    /* ---- bit writer: bw[0] = bit buffer, bw[1] = bit count ---- */
+
+    private writeBits(List<byte> output, List<int> bw, int value, int nbits) void {
+        int buf = bw[0] | (value << bw[1])
+        int cnt = bw[1] + nbits
+
+        while (cnt >= 8) {
+            output.push(Byte(buf & 255))
+            buf = buf >> 8
+            cnt = cnt - 8
+        }
+
+        bw[0] = buf
+        bw[1] = cnt
+    }
+
+    private flushBits(List<byte> output, List<int> bw) void {
+        if (bw[1] > 0) {
+            output.push(Byte(bw[0] & 255))
+            bw[0] = 0
+            bw[1] = 0
+        }
+    }
+
+    private writeStored(List<byte> output, List<int> bw, List<byte> data, int start, int end, bool isFinal) void {
+        int pos = start
+        bool first = true
+
+        while (first || pos < end) {
+            first = false
+
+            int chunk = end - pos
+            if (chunk > 65535) {
+                chunk = 65535
+            }
+
+            if (isFinal && pos + chunk >= end) {
+                this.writeBits(output, bw, 1, 3)
+            } else {
+                this.writeBits(output, bw, 0, 3)
+            }
+            this.flushBits(output, bw)
+
+            this.pushU16(output, chunk)
+            this.pushU16(output, 65535 - chunk)
+            this.appendRange(output, data, pos, pos + chunk)
+
+            pos = pos + chunk
+        }
+    }
+
+    private reverseBits(int code, int nbits) int {
+        int result = 0
+        int c = code
+        int i = 0
+        while (i < nbits) {
+            result = (result << 1) | (c & 1)
+            c = c >> 1
+            i = i + 1
+        }
+        return result
+    }
+
+    /* Canonical Huffman codes (already bit-reversed for LSB-first output). */
+    private buildCodes(List<int> lens, int n) List<int> {
+        List<int> blCount = this.zeros(16)
+        int i = 0
+        while (i < n) {
+            if (lens[i] > 0) {
+                blCount[lens[i]] = blCount[lens[i]] + 1
+            }
+            i = i + 1
+        }
+
+        List<int> next = this.zeros(17)
+        int code = 0
+        int bits = 1
+        while (bits <= 15) {
+            code = (code + blCount[bits - 1]) * 2
+            next[bits] = code
+            bits = bits + 1
+        }
+
+        List<int> codes = this.zeros(n)
+        i = 0
+        while (i < n) {
+            int l = lens[i]
+            if (l > 0) {
+                codes[i] = this.reverseBits(next[l], l)
+                next[l] = next[l] + 1
+            }
+            i = i + 1
+        }
+
+        return codes
+    }
+
+    private sortInts(List<int> a) void {
+        int i = 1
+        while (i < a.length) {
+            int v = a[i]
+            int j = i - 1
+            while (j >= 0 && a[j] > v) {
+                a[j + 1] = a[j]
+                j = j - 1
+            }
+            a[j + 1] = v
+            i = i + 1
+        }
+    }
+
+    /*
+        Length-limited Huffman code lengths for n symbols (maxBits <= 15).
+        Always yields at least two codes so the result is a complete code.
+    */
+    private buildLengths(List<int> freq, int n, int maxBits) List<int> {
+        List<int> lens = this.zeros(n)
+        List<int> keys = []
+        int s = 0
+        while (s < n) {
+            if (freq[s] > 0) {
+                keys.push(freq[s] * 1024 + s)
+            }
+            s = s + 1
+        }
+
+        int m = keys.length
+        if (m < 2) {
+            if (m == 1) {
+                int only = keys[0] % 1024
+                int other = 0
+                if (only == 0) {
+                    other = 1
+                }
+                lens[only] = 1
+                lens[other] = 1
+            } else {
+                lens[0] = 1
+                lens[1] = 1
+            }
+            return lens
+        }
+
+        this.sortInts(keys)
+
+        List<int> w = this.zeros(2 * m)
+        List<int> parent = this.zeros(2 * m)
+        int i = 0
+        while (i < m) {
+            w[i] = keys[i] / 1024
+            i = i + 1
+        }
+
+        int leaf = 0
+        int node = m
+        int made = m
+        int k = 0
+        while (k < m - 1) {
+            int a = 0
+            if (leaf < m && (node >= made || w[leaf] <= w[node])) {
+                a = leaf
+                leaf = leaf + 1
+            } else {
+                a = node
+                node = node + 1
+            }
+
+            int b = 0
+            if (leaf < m && (node >= made || w[leaf] <= w[node])) {
+                b = leaf
+                leaf = leaf + 1
+            } else {
+                b = node
+                node = node + 1
+            }
+
+            w[made] = w[a] + w[b]
+            parent[a] = made
+            parent[b] = made
+            made = made + 1
+            k = k + 1
+        }
+
+        List<int> depth = this.zeros(2 * m)
+        int idx = 2 * m - 3
+        while (idx >= 0) {
+            depth[idx] = depth[parent[idx]] + 1
+            idx = idx - 1
+        }
+
+        List<int> blCount = this.zeros(maxBits + 1)
+        i = 0
+        while (i < m) {
+            int d = depth[i]
+            if (d > maxBits) {
+                d = maxBits
+            }
+            blCount[d] = blCount[d] + 1
+            i = i + 1
+        }
+
+        int total = 0
+        int l = 1
+        while (l <= maxBits) {
+            total = total + (blCount[l] << (maxBits - l))
+            l = l + 1
+        }
+
+        int limit = 1 << maxBits
+        while (total > limit) {
+            blCount[maxBits] = blCount[maxBits] - 1
+            int lv = maxBits - 1
+            bool found = false
+            while (lv >= 1 && !found) {
+                if (blCount[lv] > 0) {
+                    blCount[lv] = blCount[lv] - 1
+                    blCount[lv + 1] = blCount[lv + 1] + 2
+                    found = true
+                }
+                lv = lv - 1
+            }
+            total = total - 1
+        }
+
+        int cur = maxBits
+        int remaining = blCount[cur]
+        i = 0
+        while (i < m) {
+            while (remaining == 0) {
+                cur = cur - 1
+                remaining = blCount[cur]
+            }
+            lens[keys[i] % 1024] = cur
+            remaining = remaining - 1
+            i = i + 1
+        }
+
+        return lens
+    }
+
+    private fixedLitLength(int sym) int {
+        if (sym < 144) {
+            return 8
+        }
+        if (sym < 256) {
+            return 9
+        }
+        if (sym < 280) {
+            return 7
+        }
+        return 8
+    }
+
+    /* Writes one block covering data[bs..be), choosing stored, fixed or dynamic Huffman by size. */
+    private writeBlock(List<byte> output, List<int> bw, List<byte> data, int bs, int be, List<int> tokA, List<int> tokB, int tc, bool isFinal) void {
+        List<int> lenBase = this.lengthBase()
+        List<int> lenExtra = this.lengthExtra()
+        List<int> dBase = this.distBase()
+        List<int> dExtra = this.distExtra()
+        List<int> lenCodeOf = this.lengthCodeTable()
+
+        List<int> litFreq = this.zeros(286)
+        List<int> distFreq = this.zeros(30)
+        int extraTotal = 0
+
+        int t = 0
+        while (t < tc) {
+            if (tokB[t] == 0) {
+                litFreq[tokA[t]] = litFreq[tokA[t]] + 1
+            } else {
+                int lc = lenCodeOf[tokA[t]]
+                litFreq[257 + lc] = litFreq[257 + lc] + 1
+                extraTotal = extraTotal + lenExtra[lc]
+
+                int dc = this.distCode(tokB[t], dBase)
+                distFreq[dc] = distFreq[dc] + 1
+                extraTotal = extraTotal + dExtra[dc]
+            }
+            t = t + 1
+        }
+        litFreq[256] = 1
+
+        /* dynamic tables */
+        List<int> litLen = this.buildLengths(litFreq, 286, 15)
+        List<int> distLen = this.buildLengths(distFreq, 30, 15)
+
+        int hlit = 286
+        while (hlit > 257 && litLen[hlit - 1] == 0) {
+            hlit = hlit - 1
+        }
+        int hdist = 30
+        while (hdist > 1 && distLen[hdist - 1] == 0) {
+            hdist = hdist - 1
+        }
+
+        List<int> seq = []
+        int s = 0
+        while (s < hlit) {
+            seq.push(litLen[s])
+            s = s + 1
+        }
+        s = 0
+        while (s < hdist) {
+            seq.push(distLen[s])
+            s = s + 1
+        }
+
+        List<int> rleSym = []
+        List<int> rleExt = []
+        int seqLen = seq.length
+        int p = 0
+        while (p < seqLen) {
+            int v = seq[p]
+            int run = 1
+            while (p + run < seqLen && seq[p + run] == v) {
+                run = run + 1
+            }
+            p = p + run
+
+            if (v == 0) {
+                while (run >= 3) {
+                    int r = run
+                    if (r > 138) {
+                        r = 138
+                    }
+                    if (r >= 11) {
+                        rleSym.push(18)
+                        rleExt.push(r - 11)
+                    } else {
+                        rleSym.push(17)
+                        rleExt.push(r - 3)
+                    }
+                    run = run - r
+                }
+                while (run > 0) {
+                    rleSym.push(0)
+                    rleExt.push(0)
+                    run = run - 1
+                }
+            } else {
+                rleSym.push(v)
+                rleExt.push(0)
+                run = run - 1
+                while (run >= 3) {
+                    int r = run
+                    if (r > 6) {
+                        r = 6
+                    }
+                    rleSym.push(16)
+                    rleExt.push(r - 3)
+                    run = run - r
+                }
+                while (run > 0) {
+                    rleSym.push(v)
+                    rleExt.push(0)
+                    run = run - 1
+                }
+            }
+        }
+
+        List<int> clFreq = this.zeros(19)
+        int q = 0
+        while (q < rleSym.length) {
+            clFreq[rleSym[q]] = clFreq[rleSym[q]] + 1
+            q = q + 1
+        }
+        List<int> clLen = this.buildLengths(clFreq, 19, 7)
+
+        List<int> order = this.codeLengthOrder()
+        int hclen = 19
+        while (hclen > 4 && clLen[order[hclen - 1]] == 0) {
+            hclen = hclen - 1
+        }
+
+        /* sizes in bits */
+        int dynBits = 3 + 14 + 3 * hclen + extraTotal
+        q = 0
+        while (q < rleSym.length) {
+            int sym = rleSym[q]
+            dynBits = dynBits + clLen[sym]
+            if (sym == 16) {
+                dynBits = dynBits + 2
+            } else if (sym == 17) {
+                dynBits = dynBits + 3
+            } else if (sym == 18) {
+                dynBits = dynBits + 7
+            }
+            q = q + 1
+        }
+
+        int fixedBits = 3 + extraTotal
+        s = 0
+        while (s < 286) {
+            dynBits = dynBits + litFreq[s] * litLen[s]
+            fixedBits = fixedBits + litFreq[s] * this.fixedLitLength(s)
+            s = s + 1
+        }
+        s = 0
+        while (s < 30) {
+            dynBits = dynBits + distFreq[s] * distLen[s]
+            fixedBits = fixedBits + distFreq[s] * 5
+            s = s + 1
+        }
+
+        int rawLen = be - bs
+        int pieces = (rawLen + 65534) / 65535
+        if (pieces < 1) {
+            pieces = 1
+        }
+        int storedBits = rawLen * 8 + pieces * 42
+
+        int finalBit = 0
+        if (isFinal) {
+            finalBit = 1
+        }
+
+        /* choose the smallest encoding */
+        if (storedBits < dynBits && storedBits < fixedBits) {
+            this.writeStored(output, bw, data, bs, be, isFinal)
+            return
+        }
+
+        List<int> litCodes = []
+        List<int> distCodes = []
+        List<int> usedLitLen = []
+        List<int> usedDistLen = []
+
+        if (dynBits < fixedBits) {
+            this.writeBits(output, bw, finalBit + 4, 3)
+            this.writeBits(output, bw, hlit - 257, 5)
+            this.writeBits(output, bw, hdist - 1, 5)
+            this.writeBits(output, bw, hclen - 4, 4)
+
+            int h = 0
+            while (h < hclen) {
+                this.writeBits(output, bw, clLen[order[h]], 3)
+                h = h + 1
+            }
+
+            List<int> clCodes = this.buildCodes(clLen, 19)
+            q = 0
+            while (q < rleSym.length) {
+                int sym = rleSym[q]
+                this.writeBits(output, bw, clCodes[sym], clLen[sym])
+                if (sym == 16) {
+                    this.writeBits(output, bw, rleExt[q], 2)
+                } else if (sym == 17) {
+                    this.writeBits(output, bw, rleExt[q], 3)
+                } else if (sym == 18) {
+                    this.writeBits(output, bw, rleExt[q], 7)
+                }
+                q = q + 1
+            }
+
+            usedLitLen = litLen
+            usedDistLen = distLen
+        } else {
+            this.writeBits(output, bw, finalBit + 2, 3)
+
+            List<int> fl = []
+            s = 0
+            while (s < 288) {
+                fl.push(this.fixedLitLength(s))
+                s = s + 1
+            }
+            usedLitLen = fl
+            usedDistLen = this.filled(30, 5)
+        }
+
+        litCodes = this.buildCodes(usedLitLen, usedLitLen.length)
+        distCodes = this.buildCodes(usedDistLen, 30)
+
+        t = 0
+        while (t < tc) {
+            if (tokB[t] == 0) {
+                int sym = tokA[t]
+                this.writeBits(output, bw, litCodes[sym], usedLitLen[sym])
+            } else {
+                int mlen = tokA[t]
+                int lc = lenCodeOf[mlen]
+                this.writeBits(output, bw, litCodes[257 + lc], usedLitLen[257 + lc])
+                if (lenExtra[lc] > 0) {
+                    this.writeBits(output, bw, mlen - lenBase[lc], lenExtra[lc])
+                }
+
+                int dist = tokB[t]
+                int dc = this.distCode(dist, dBase)
+                this.writeBits(output, bw, distCodes[dc], usedDistLen[dc])
+                if (dExtra[dc] > 0) {
+                    this.writeBits(output, bw, dist - dBase[dc], dExtra[dc])
+                }
+            }
+            t = t + 1
+        }
+
+        this.writeBits(output, bw, litCodes[256], usedLitLen[256])
     }
 }
 
